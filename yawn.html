@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Yawn</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500&display=swap">
+<style>
+  :root { --txt:rgba(255,236,214,.72); }
+  * { box-sizing:border-box; }
+  html,body { margin:0; min-height:100vh; color:var(--txt); font-family:'Quicksand',system-ui,sans-serif;
+    background:linear-gradient(#1d1a45,#3b2f6b 60%,#6d4f86); }
+  main { max-width:960px; margin:0 auto; padding:18px 14px; text-align:center; }
+  canvas { width:100%; max-width:920px; height:auto; display:block; margin:0 auto; border-radius:28px; cursor:none; touch-action:none;
+           box-shadow:0 20px 80px rgba(10,6,40,.55); }
+  .controls { display:flex; gap:22px; justify-content:center; align-items:center; margin:16px 0 4px; font-size:14px; letter-spacing:.12em; }
+  input[type=range] { accent-color:#ffd9a0; width:150px; }
+  button { font:inherit; letter-spacing:.12em; color:var(--txt); background:transparent; border:1px solid rgba(255,236,214,.35);
+           border-radius:999px; padding:5px 16px; cursor:pointer; }
+  button:hover { background:rgba(255,236,214,.12); }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="c" width="920" height="640"></canvas>
+  <div class="controls">
+    <label>boring <input id="bore" type="range" min="0" max="1" step="0.05" value="0.8"></label>
+    <button id="reset">reset</button>
+  </div>
+</main>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const DPR = Math.min(window.devicePixelRatio || 1, 2), W = 920, H = 640;
+cv.width = W * DPR; cv.height = H * DPR;
+const $ = id => document.getElementById(id);
+const rnd = (a, b) => a + Math.random() * (b - a), pick = a => a[Math.random() * a.length | 0];
+const mix = (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+const rgb = c => `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+
+const ROWS = 17, TOP_Y = 118, BOT_Y = 556, FRONT_HR = 26, K = .5, CD = .07, AISLES = [];   // CD: seconds for a yawn to travel one head-width
+const FOG = [200, 182, 232], GOLD = [255, 222, 160];
+const CLOAKS = [[48,42,104]];
+const SKINS = [[238,200,168]];
+
+let G0 = .02, G1 = .75, BASE = .02;
+let people, rows, events, motes, T = 0, last = 0, sdt = .016, paused = false, total = 0, hint = 1;
+let spots = [], cutRings = [], zs = [], nextSpot = 1.5;                            // spotlights come and go on their own
+
+const jit = (c, a) => { const d = rnd(-a, a); return c.map(v => v + d + rnd(-2, 2)); };   // same colour, slightly lighter or darker
+
+function reset() {
+  people = []; rows = []; events = []; motes = []; spots = []; cutRings = []; zs = []; nextSpot = 2; total = 0;
+  for (let r = ROWS - 1; r >= 0; r--) {                                   // back row first so front rows paint over
+    const t = r / (ROWS - 1), persp = (1 - 1 / (1 + K * t)) / (1 - 1 / (1 + K));
+    const y = BOT_Y - (BOT_Y - TOP_Y) * persp, hr = FRONT_HR / (1 + 1.15 * t);
+    const n = Math.round(12 + 22 * t), margin = 30, row = { y, t, hr, people: [] }; rows.push(row);
+    const gap = 14 + hr * .7;
+    for (let i = 0; i < n; i++) {
+      const x = margin + (W - 2 * margin) * ((i + .5 + (r % 2 ? .25 : -.25)) / n) + rnd(-2, 2) * hr / 10;
+      if (AISLES.some(a => Math.abs(x - a) < gap) || Math.random() < .07) continue;   // a few empty seats
+      const person = {
+        x, y: y + rnd(-1.5, 1.5), t, hand: Math.random() < .6, hs: Math.random() < .5 ? -1 : 1, hr: hr * rnd(.92, 1.08), skin: jit(SKINS[0], 7), cloak: jit(CLOAKS[0], 13), style: (q => q < .35 ? 0 : q < .6 ? 3 : q < .8 ? 1 : 2)(Math.random()), slump: rnd(0, .22),
+        sleepy: rnd(0, .98), heat: 0, rate: rnd(.4, 1.8), sus: rnd(.6, 1.5),
+        yStart: -9, yDur: 2.4, rest: 0, caught: -9, alertUntil: 0, alertV: 0, fadeOpen: 0, fadeT: -9, blinkStart: 0, nextBlink: rnd(0, 5), blinkEnd: 0, sway: rnd(0, 7), lit: 0, nb: null,
+      };
+      people.push(person); row.people.push(person);
+    }
+  }
+  for (const p of people) {                                               // neighbors, measured in head-widths
+    p.nb = [];
+    for (const q of people) {
+      if (q === p) continue;
+      const d = Math.hypot(q.x - p.x, (q.y - p.y) * 1.8) / p.hr;
+      if (d < 6.5) p.nb.push({ q, d });
+    }
+  }
+}
+
+function startYawn(p, boost = 1) {
+  p.yStart = T; p.yDur = rnd(2.2, 2.9); total++;
+  p.rest = T + p.yDur + rnd(.15, .7); p.sleepy = 0; p.heat = 0;
+  if (boost > 1) for (const { q, d } of p.nb) q.heat += .5 * (1 - d / 6.5) * boost / 2.5;   // (kept for manual seeding)
+}
+
+function cutYawn(p) {                                                       // a yawn stopped short closes in ~0.2s instead of vanishing
+  const ph = (T - p.yStart) / p.yDur;
+  if (ph >= 0 && ph < 1) { p.fadeOpen = env(ph); p.fadeT = T; }
+  p.yStart = -9;
+}
+function addSpot(p, life) { spots.push({ x: p.x, y: p.y, R: p.hr * 2.7, t: 0, life, a: 0 }); }
+function caught(p) {                                                        // light hits a yawner: yawn stops dead, and nearby people sit up
+  cutYawn(p); p.caught = T; p.rest = T + rnd(2.5, 4); p.heat = 0; p.sleepy = 0;
+  for (const { q, d } of p.nb) if (d < 4.5) events.push({ at: T + .1 + d * CD * 2, q, alert: true });
+}
+
+function update(dt) {
+  T += dt;
+  const bore = parseFloat($('bore').value);
+  nextSpot -= dt;                                                            // a spotlight lands on a random face
+  if (nextSpot <= 0) { addSpot(pick(people), rnd(1.2, 1.8)); nextSpot = rnd(1.8, 3.2); }
+  for (let i = spots.length - 1; i >= 0; i--) {
+    const sp = spots[i]; sp.t += dt; sp.a = Math.min(sp.t / .35, 1) * Math.max(0, Math.min((sp.life - sp.t) / .35, 1));
+    if (sp.t > sp.life) spots.splice(i, 1);
+  }
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]; if (e.at > T) continue;
+    if (e.alert) {                                                           // "someone got caught": sit up straight
+      e.q.alertUntil = T + 1.8; e.q.heat = 0; e.q.sleepy *= .4;
+      if (T - e.q.yStart < e.q.yDur) { cutYawn(e.q); e.q.rest = T + 1.5; }  // stifles a yawn already under way
+    } else if (T > e.q.rest && e.q.yStart + e.q.yDur < T && T > e.q.alertUntil) e.q.heat += e.amt * (1 - e.q.lit * .9);
+    events.splice(i, 1);
+  }
+  const rate = G0 + G1 * bore;                                               // seeing a yawn keeps making you sleepier, for as long as it lasts
+  for (const p of people) {
+    const age = T - p.yStart; if (age < .1 || age > p.yDur) continue;
+    for (const { q, d } of p.nb)
+      if (age > .1 + d * CD && T > q.rest && T > q.alertUntil && T - q.yStart > q.yDur) q.heat += rate * (1 - d / 6.5) * q.sus * dt;
+  }
+  for (const p of people) {
+    let target = 0;
+    for (const sp of spots) target = Math.max(target, sp.a * Math.max(0, Math.min(1, (sp.R * 1.25 - Math.hypot(p.x - sp.x, (p.y - sp.y) * 1.2)) / (sp.R * .6))));
+    p.lit += (target - p.lit) * Math.min(1, dt * 12);
+    p.alertV += ((T < p.alertUntil ? 1 : 0) - p.alertV) * Math.min(1, dt * 7);
+    const yawning = T - p.yStart < p.yDur;
+    if (yawning && p.lit > .5) caught(p);                                       // oops
+    const tired = p.sleepy + p.heat;
+    if (!yawning && tired > .4 && zs.length < 140 && Math.random() < dt * (tired - .3) * 1.6)
+      zs.push({ x: p.x + p.hr * .7, y: p.y - p.hr * 1.1, s: p.hr * .6, t0: T, ph: rnd(0, 7) });
+    if (!yawning) {
+      if (T > p.rest) p.sleepy += dt * BASE * (.2 + 2.8 * bore) * p.rate;
+      p.heat -= dt * (.12 + p.lit * .8) * p.heat;
+      if (p.sleepy + p.heat >= 1 && T > p.rest && p.lit < .5 && T > p.alertUntil) startYawn(p);
+    }
+    if (T > p.nextBlink) { const sl = Math.min(1, p.sleepy + p.heat); p.blinkStart = T; p.blinkEnd = T + .16 + sl * .25; p.nextBlink = T + rnd(2, 6) * (1.3 - sl * .5); }
+  }
+  for (let i = motes.length - 1; i >= 0; i--) {
+    const m = motes[i]; m.y -= m.vy * dt * 60 * (m.warm ? .6 : 1); m.x += Math.sin(T + i) * .15;
+    if (m.warm) { m.life -= dt * .5; if (m.life <= 0) motes.splice(i, 1); }
+    else if (m.y < -5) { m.y = H + 5; m.x = rnd(0, W); }
+  }
+}
+
+/* ---------- drawing ---------- */
+const smooth = k => k * k * (3 - 2 * k);
+function env(ph) { return ph < .3 ? smooth(ph / .3) : ph < .72 ? 1 : smooth((1 - ph) / .28); }   // slow open, hold, slow close
+
+function drawZ() {                                                          // sleepy people let out little z's, so you can see it spreading
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (let i = zs.length - 1; i >= 0; i--) {
+    const z = zs[i], age = T - z.t0; if (age > 1.6) { zs.splice(i, 1); continue; }
+    ctx.font = `700 ${Math.max(7, z.s * (1 + age * .5))}px Quicksand, system-ui, sans-serif`;
+    ctx.fillStyle = `rgba(240,235,255,${.85 * Math.min(1, age * 5) * (1 - age / 1.6)})`;
+    ctx.fillText('z', z.x + Math.sin(age * 3 + z.ph) * 3 + age * 8, z.y - age * 22);
+  }
+}
+
+function drawRiser(row) {                                                   // the tier each row sits on
+  const f = .05 + .4 * Math.pow(row.t, .9), y0 = row.y + row.hr * .85, h = row.hr * 1.6, gap = 10 + row.hr * .7;
+  ctx.fillStyle = rgb(mix([58, 44, 110], FOG, f)); ctx.fillRect(34, y0, W - 68, h);
+  ctx.fillStyle = rgb(mix([150, 128, 200], FOG, f * .8)); ctx.fillRect(34, y0, W - 68, Math.max(1.5, row.hr * .1));
+  ctx.fillStyle = 'rgba(255,232,200,.2)'; for (const a of AISLES) ctx.fillRect(a - gap, y0, gap * 2, h);   // aisle steps
+}
+
+function drawPerson(p) {
+  const hr = p.hr, yph = (T - p.yStart) / p.yDur, yawning = yph >= 0 && yph < 1, oops = T - p.caught < 1.5, awake = Math.max(p.lit, p.alertV);
+  const open = yawning ? env(yph) : (T - p.fadeT < .2 ? p.fadeOpen * (1 - (T - p.fadeT) / .2) : 0);
+  const oa = T - p.caught, ok = oops ? Math.min(1, oa / .12) * Math.min(1, (1.5 - oa) * 2.2) : 0;   // eases in and out
+  const x = p.x + Math.sin(T * .8 + p.sway) * hr * .04, y = p.y + p.slump * hr - open * hr * .22;   // head tips back
+  const fog = .02 + .12 * Math.pow(p.t, .9), dk = .26 * Math.pow(1 - p.t, 1.4);   // near rows sit in shadow, far rows in mist
+  let cloak = mix(mix(p.cloak, [12, 8, 34], dk), FOG, fog), skin = mix(mix(p.skin, [40, 24, 60], dk * .8), FOG, fog * .8);
+  cloak = mix(cloak, GOLD, p.lit * .15); skin = mix(skin, [255, 240, 205], p.lit * .08);
+  if (ok > 0) skin = mix(skin, [232, 84, 92], .7 * ok);   // caught: face goes red
+  const ink = mix([40, 26, 70], FOG, fog * .3), sleepy = Math.min(1, p.sleepy + p.heat);
+  ctx.fillStyle = rgb(cloak);                                               // cloak
+  ctx.beginPath(); ctx.ellipse(x, y + hr * 1.3, hr * 1.3, hr * 1.05, 0, 0, 7); ctx.fill();
+  const hairC = rgb(mix(cloak, [14, 10, 38], .4));                           // hair: same hue as the cloak, a shade darker
+  if (p.style === 1 || p.style === 2) {                                      // bob / long hair, behind the head
+    ctx.fillStyle = hairC; ctx.beginPath();
+    if (p.style === 1) ctx.roundRect(x - hr * 1.08, y - hr * .25, hr * 2.16, hr * 1.3, hr * .55);
+    else ctx.roundRect(x - hr * 1.12, y - hr * .3, hr * 2.24, hr * 2.15, hr * .6);
+    ctx.fill();
+  }
+  ctx.fillStyle = rgb(skin); ctx.beginPath(); ctx.arc(x, y, hr, 0, 7); ctx.fill();   // head
+  ctx.fillStyle = hairC; ctx.beginPath();
+  const top = Math.PI * 1.02, hx = hr * 1.05;                                // every style = the top of the head, with its own hairline
+  if (p.style === 3) {                                                       // short cut: high, flat hairline
+    ctx.arc(x, y, hx, Math.PI, Math.PI * 2); ctx.lineTo(x + hr, y - hr * .42); ctx.quadraticCurveTo(x, y - hr * .66, x - hr, y - hr * .42); ctx.closePath();
+  } else if (p.style === 0) {                                                // side part, swept across
+    ctx.arc(x, y, hx, top, Math.PI * 1.98);
+    ctx.quadraticCurveTo(x + hr * .45, y - hr * .5, x - hr * .15, y - hr * .8); ctx.quadraticCurveTo(x - hr * .65, y - hr * .45, x - hx, y - hr * .1);
+  } else {                                                                   // bob / long: centre part, hair falls down both sides
+    ctx.arc(x, y, hx, top, Math.PI * 1.98);
+    ctx.quadraticCurveTo(x + hr * .75, y - hr * .6, x, y - hr * .86); ctx.quadraticCurveTo(x - hr * .75, y - hr * .6, x - hx, y - hr * .1);
+  }
+  ctx.fill();
+  const ex = hr * .4, ey = y + hr * .02, er = Math.max(1.4, hr * .12), lid = Math.min(.7, sleepy * .7);
+  const bl = T < p.blinkEnd ? Math.sin(Math.PI * (T - p.blinkStart) / (p.blinkEnd - p.blinkStart)) : 0;   // a blink is a smooth dip, not a snap
+  const squeeze = smooth(Math.min(1, open * 3)), shut = Math.max(bl, squeeze);                             // eyes screw up as the yawn builds
+  ctx.fillStyle = rgb(ink); ctx.strokeStyle = rgb(ink); ctx.lineCap = 'round';
+  if (oops) {                                                                // wide-eyed: caught!
+    const w = Math.max(er * 1.9, 2.4);
+    for (const k of [-1, 1]) { ctx.fillStyle = rgb(mix([255, 255, 255], FOG, fog * .4)); ctx.beginPath(); ctx.arc(x + k * ex, ey, w, 0, 7); ctx.fill();
+      ctx.fillStyle = rgb(ink); ctx.beginPath(); ctx.arc(x + k * ex + (k * -.4), ey + w * .1, w * .45, 0, 7); ctx.fill(); }
+  } else if (shut > .8) {                                                    // closed: flat line when blinking, curved when squeezed
+    ctx.lineWidth = Math.max(1.3, hr * .09) + (Math.max(1.6, hr * .13) - Math.max(1.3, hr * .09)) * squeeze;
+    for (const k of [-1, 1]) { ctx.beginPath(); ctx.moveTo(x + k * ex - er * 1.3, ey - er * .2 * squeeze); ctx.quadraticCurveTo(x + k * ex, ey + er * 1.7 * squeeze, x + k * ex + er * 1.3, ey - er * .2 * squeeze); ctx.stroke(); }
+    if (hr > 14 && open > .6) { ctx.fillStyle = `rgba(170,215,255,${Math.min(1, (open - .6) * 3) * .95})`; ctx.beginPath(); ctx.arc(x + ex * 1.45, ey + er * 2.4, er * .75, 0, 7); ctx.fill(); }   // a tear
+  } else {
+    const s = 1 + awake * .35, ry = er * s * (1 - lid) * (1 - shut / .8);
+    for (const k of [-1, 1]) { ctx.beginPath(); ctx.ellipse(x + k * ex, ey + er * lid * .5, er * s * (1 + shut * .3), Math.max(.3, ry), 0, 0, 7); ctx.fill(); }
+  }
+  const my = y + hr * .46;
+  if (oops) {                                                                // sheepish wobbly mouth
+    ctx.lineWidth = Math.max(1.2, hr * .08); ctx.beginPath(); ctx.moveTo(x - hr * .22, my + hr * .08);
+    ctx.quadraticCurveTo(x - hr * .1, my - hr * .06, x, my + hr * .08); ctx.quadraticCurveTo(x + hr * .1, my + hr * .22, x + hr * .22, my + hr * .06); ctx.stroke();
+  } else {
+    const sm = 1 - Math.min(1, open * 8);                                    // the little smile melts into the yawn
+    if (sm > .02) { ctx.globalAlpha = sm; ctx.lineWidth = Math.max(1.3, hr * .09); ctx.beginPath(); ctx.moveTo(x - hr * .18, my); ctx.quadraticCurveTo(x, my + hr * (.1 - sleepy * .1), x + hr * .18, my); ctx.stroke(); ctx.globalAlpha = 1; }
+    if (open > .01) {
+      ctx.fillStyle = `rgb(${mix([84, 36, 84], FOG, fog * .5).map(v => v | 0)})`;
+      const ry = hr * .6 * open, rx = hr * (.12 + .16 * open);
+      ctx.beginPath(); ctx.ellipse(x, my + ry * .5, rx, ry, 0, 0, 7); ctx.fill();
+      if (hr > 12) { ctx.fillStyle = `rgb(${mix([190, 90, 110], FOG, fog * .4).map(v => v | 0)})`; ctx.beginPath(); ctx.ellipse(x, my + ry * 1.1, rx * .7, ry * .35, 0, 0, 7); ctx.fill(); }
+    }
+  }
+  if (p.hand && open > .02) {                                                // hand over the mouth, rising and lowering with the yawn
+    const hx = x + p.hs * hr * .1, hy = my + hr * .38 + (1 - Math.min(1, open * 1.8)) * hr * 1.2;
+    ctx.fillStyle = rgb(mix(skin, [255, 255, 255], .08)); ctx.strokeStyle = rgb(mix(skin, ink, .4)); ctx.lineWidth = Math.max(1, hr * .07);
+    ctx.beginPath(); ctx.ellipse(hx, hy, hr * .44, hr * .36, 0, 0, 7); ctx.fill(); ctx.stroke();
+    if (hr > 13) for (const i of [-1, 0, 1]) { ctx.beginPath(); ctx.moveTo(hx + i * hr * .15, hy - hr * .32); ctx.lineTo(hx + i * hr * .15, hy - hr * .08); ctx.stroke(); }
+  }
+  if (oops) {
+    const k = Math.min(1, oa / .1) * Math.min(1, (1.5 - oa) * 2);            // pops in fast, fades out slowly
+    ctx.fillStyle = `rgba(255,120,140,${.45 * k})`;                          // blush
+    for (const s2 of [-1, 1]) { ctx.beginPath(); ctx.ellipse(x + s2 * hr * .62, my - hr * .08, hr * .2, hr * .13, 0, 0, 7); ctx.fill(); }
+    ctx.fillStyle = `rgba(160,210,255,${.95 * k})`; ctx.beginPath(); ctx.ellipse(x + hr * .86, y - hr * .35, Math.max(1.2, hr * .1), Math.max(2, hr * .18), 0, 0, 7); ctx.fill();   // sweat drop
+    if (hr > 11) { ctx.fillStyle = `rgba(255,236,170,${k})`; const bx = x, by = y - hr * 1.5, bw = Math.max(1.6, hr * .13);       // "!"
+      ctx.fillRect(bx - bw / 2, by - hr * .5, bw, hr * .55); ctx.beginPath(); ctx.arc(bx, by + hr * .2, bw * .7, 0, 7); ctx.fill(); }
+  }
+}
+
+function drawStage() {
+  for (const side of [0, 1]) {                                              // velvet curtains framing the view
+    ctx.save(); if (side) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+    const g = ctx.createLinearGradient(0, 0, 120, 0); g.addColorStop(0, '#1a0826'); g.addColorStop(.6, '#3d1a52'); g.addColorStop(1, '#5a2a6a');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(120, 0);
+    for (let y = 0; y <= H; y += 20) ctx.lineTo(70 + 22 * (1 - y / H) + Math.sin(y * .03 + T * .4) * 5, y);
+    ctx.lineTo(0, H); ctx.fill();
+    ctx.fillStyle = 'rgba(10,4,24,.28)'; for (let i = 0; i < 4; i++) ctx.fillRect(14 + i * 20, 0, 6, H);
+    ctx.restore();
+  }
+  const vg = ctx.createLinearGradient(0, 0, 0, 50); vg.addColorStop(0, '#1a0826'); vg.addColorStop(1, '#3d1a52');   // valance
+  ctx.fillStyle = vg; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(W, 0);
+  for (let x = W; x >= 0; x -= 46) ctx.quadraticCurveTo(x - 23, 62, x - 46, 36); ctx.fill();
+  const fl = ctx.createLinearGradient(0, 584, 0, H); fl.addColorStop(0, '#3a2562'); fl.addColorStop(1, '#0e0824');    // stage floor
+  ctx.fillStyle = fl; ctx.fillRect(0, 586, W, H - 586);
+  ctx.fillStyle = 'rgba(255,214,150,.55)'; ctx.fillRect(0, 585, W, 2);
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';                     // footlights
+  for (let x = 40; x < W; x += 56) {
+    const g = ctx.createRadialGradient(x, 588, 0, x, 588, 46); g.addColorStop(0, 'rgba(255,214,150,.55)'); g.addColorStop(1, 'rgba(255,214,150,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, 588, 46, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+  ctx.fillStyle = '#0b0620'; ctx.strokeStyle = 'rgba(255,214,150,.45)'; ctx.lineWidth = 1.5;   // mic stand, in the foreground
+  ctx.fillRect(764, 400, 7, 240); ctx.strokeRect(764, 400, 7, 240);
+  ctx.beginPath(); ctx.ellipse(767.5, 392, 15, 22, -.25, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(767.5, 640, 36, 9, 0, 0, 7); ctx.fill();
+}
+
+function frame(ts) {
+  const raw = Math.min(Math.max((ts - last) / 1000 || .016, .006), .05); last = ts;
+  sdt += (raw - sdt) * .2; const dt = sdt;                                  // smoothed step: no stutter from uneven frame timing
+  if (!paused) update(dt);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const bg = ctx.createLinearGradient(0, 0, 0, H);                          // dusk
+  bg.addColorStop(0, '#1e1b4a'); bg.addColorStop(.28, '#4a3a86'); bg.addColorStop(.4, '#c98aa8'); bg.addColorStop(.5, '#f5c2a2'); bg.addColorStop(1, '#6d5aa0');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  const sun = ctx.createRadialGradient(W / 2, 200, 10, W / 2, 200, 420);
+  sun.addColorStop(0, 'rgba(255,236,190,.65)'); sun.addColorStop(1, 'rgba(255,236,190,0)');
+  ctx.fillStyle = sun; ctx.fillRect(0, 0, W, H);
+  for (const m of motes) { ctx.fillStyle = m.warm ? `rgba(255,222,150,${m.a * m.life})` : `rgba(255,240,220,${m.a})`; ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, 7); ctx.fill(); }
+  ctx.save(); ctx.translate(Math.sin(T * .5) * 3, Math.cos(T * .37) * 2.5);   // camera breathes
+  for (const row of rows) { drawRiser(row); for (const p of row.people) drawPerson(p);
+    ctx.fillStyle = 'rgba(200,182,232,.03)'; ctx.fillRect(34, 0, W - 68, row.y + row.hr * 2); }   // a thin veil of mist per row, so distance builds up   // back to front, each row on its own step
+  drawZ();
+  ctx.restore();
+  ctx.restore();
+  for (const spot of spots) if (spot.a > .01) {                                                       // the house dims, one small beam lights a face or two
+    const R = spot.R, dark = ctx.createRadialGradient(spot.x, spot.y, R * .9, spot.x, spot.y, R * 6);
+    dark.addColorStop(0, 'rgba(14,8,44,0)'); dark.addColorStop(1, `rgba(14,8,44,${.5 * spot.a})`);
+    ctx.fillStyle = dark; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    const yEnd = spot.y + R * 2.6, f = spot.y / yEnd;                         // the beam keeps going past the face and fades out, no hard end
+    const cone = ctx.createLinearGradient(0, 0, 0, yEnd);
+    cone.addColorStop(0, 'rgba(255,214,150,0)'); cone.addColorStop(f * .5, `rgba(255,214,150,${.045 * spot.a})`);
+    cone.addColorStop(f, `rgba(255,214,150,${.06 * spot.a})`); cone.addColorStop(1, 'rgba(255,214,150,0)');
+    ctx.fillStyle = cone;
+    for (let L = 0; L < 5; L++) {                                            // stacked layers, narrower each time = soft edges
+      const w = 1 - L * .17, top = 7 * w, bot = (R * 1.25 + (yEnd - spot.y) * .55) * w;
+      ctx.beginPath(); ctx.moveTo(spot.x - top, -10); ctx.lineTo(spot.x + top, -10); ctx.lineTo(spot.x + bot, yEnd); ctx.lineTo(spot.x - bot, yEnd); ctx.closePath(); ctx.fill();
+    }
+    const pool = ctx.createRadialGradient(spot.x, spot.y, 0, spot.x, spot.y, R * 1.5);
+    pool.addColorStop(0, `rgba(255,235,190,${.22 * spot.a})`); pool.addColorStop(.6, `rgba(255,215,160,${.11 * spot.a})`); pool.addColorStop(1, 'rgba(255,205,140,0)');
+    ctx.fillStyle = pool; ctx.beginPath(); ctx.ellipse(spot.x, spot.y, R * 1.5, R * 1.3, 0, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+  drawStage();
+  const fade = ctx.createLinearGradient(0, 560, 0, H); fade.addColorStop(0, 'rgba(20,12,50,0)'); fade.addColorStop(1, 'rgba(20,12,50,.85)');
+  ctx.fillStyle = fade; ctx.fillRect(0, 560, W, H - 560);
+  requestAnimationFrame(frame);
+}
+
+function pt(e) { const r = cv.getBoundingClientRect(), s = W / r.width; return [(e.clientX - r.left) * s, (e.clientY - r.top) * s]; }
+cv.addEventListener('pointerdown', e => {                                   // your own spotlight, wherever you click
+  const [x, y] = pt(e); let best = null, bd = 1e9;
+  for (const p of people) { const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; best = p; } }
+  addSpot(best, 1.8);
+});
+$('reset').onclick = reset;
+reset();
+for (let i = 0; i < 600; i++) update(.05);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
